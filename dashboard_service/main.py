@@ -13,21 +13,17 @@ import logging
 from dotenv import load_dotenv
 import os
 
-# Load environment variables
 load_dotenv()
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = os.getenv("REDIS_PORT")
 
-# Initialize Redis
 redis_client = redis.Redis(host=REDIS_HOST, port=int(REDIS_PORT), decode_responses=True)
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -45,15 +41,19 @@ async def get_dashboard(
     date_start: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
     date_end: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)")
 ):
-    """Get user-specific dashboard history with filters"""
-    cache_key = f"dashboard:user:{user.id}:type{type or 'all'}:keyword{keyword or 'none'}:start{date_start or 'none'}:end{date_end or 'none'}"
+    cache_key = f"dashboard:user:{user.id}:type:{type or 'all'}:keyword:{keyword or 'none'}:start:{date_start or 'none'}:end:{date_end or 'none'}"
     cached_data = redis_client.get(cache_key)
     if cached_data:
-        logger.info(f"Returning cached history for user {user.id}")
-        return json.loads(cached_data)
+        history_data = json.loads(cached_data)
+        if history_data:  # Only return cached data if non-empty
+            logger.info(f"Returning cached history for user {user.id}")
+            return history_data
+        logger.info(f"Cached data empty for user {user.id}, querying database")
 
-    query = db.query(History).filter(History.user_id == user.id)
-    if type:
+    query = db.query(History)
+    if user.role != "admin":
+        query = query.filter(History.user_id == user.id)
+    if type and type != "all":
         query = query.filter(History.type == type)
     if keyword:
         query = query.filter(or_(History.query.contains(keyword), History.result.contains(keyword)))
@@ -63,9 +63,20 @@ async def get_dashboard(
         query = query.filter(History.created_at <= date_end)
     
     history = query.all()
-    redis_client.setex(cache_key, 3600, json.dumps([h.__dict__ for h in history]))
+    history_data = [
+        {
+            "id": h.id,
+            "user_id": h.user_id,
+            "type": h.type,
+            "query": h.query,
+            "result": h.result,
+            "created_at": h.created_at.isoformat(),
+            "meta_data": h.meta_data
+        } for h in history
+    ]
+    redis_client.setex(cache_key, 3600, json.dumps(history_data))
     logger.info(f"User {user.username} fetched dashboard history")
-    return history
+    return history_data
 
 @app.put("/dashboard/{id}", response_model=HistoryResponse)
 async def update_dashboard(
@@ -74,8 +85,10 @@ async def update_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update a specific history entry owned by the user"""
-    history = db.query(History).filter(History.id == id, History.user_id == user.id).first()
+    query = db.query(History)
+    if user.role != "admin":
+        query = query.filter(History.user_id == user.id)
+    history = query.filter(History.id == id).first()
     if not history:
         raise HTTPException(status_code=404, detail="Entry not found")
     
@@ -87,10 +100,17 @@ async def update_dashboard(
     db.commit()
     db.refresh(history)
     
-    # Invalidate cache
     redis_client.delete(f"dashboard:user:{user.id}:*")
     logger.info(f"User {user.username} updated history entry {id}")
-    return history
+    return {
+        "id": history.id,
+        "user_id": history.user_id,
+        "type": history.type,
+        "query": history.query,
+        "result": history.result,
+        "created_at": history.created_at.isoformat(),
+        "meta_data": history.meta_data
+    }
 
 @app.delete("/dashboard/{id}")
 async def delete_dashboard(
@@ -98,15 +118,16 @@ async def delete_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Delete a specific history entry owned by the user"""
-    history = db.query(History).filter(History.id == id, History.user_id == user.id).first()
+    query = db.query(History)
+    if user.role != "admin":
+        query = query.filter(History.user_id == user.id)
+    history = query.filter(History.id == id).first()
     if not history:
         raise HTTPException(status_code=404, detail="Entry not found")
     
     db.delete(history)
     db.commit()
     
-    # Invalidate cache
     redis_client.delete(f"dashboard:user:{user.id}:*")
     logger.info(f"User {user.username} deleted history entry {id}")
     return {"detail": "Entry deleted"}

@@ -60,9 +60,11 @@ async def get_all_users(
         query = query.filter(User.role == role_filter)
     
     users = query.offset(skip).limit(limit).all()
-    redis_client.setex(cache_key, 3600, json.dumps([user.__dict__ for user in users]))
+    # Serialize only relevant fields
+    user_data = [{"id": user.id, "username": user.username, "role": user.role} for user in users]
+    redis_client.setex(cache_key, 3600, json.dumps(user_data))
     logger.info(f"Admin {admin_user.username} fetched {len(users)} users")
-    return users
+    return user_data
 
 @app.get("/users/{user_id}", response_model=UserResponse)
 async def get_user_by_id(

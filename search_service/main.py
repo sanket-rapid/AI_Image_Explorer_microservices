@@ -90,6 +90,11 @@ async def search_query(
         db.add(history)
         db.commit()
         db.refresh(history)
+
+        # Invalidate dashboard cache for this user
+        keys = redis_client.keys(f"dashboard:user:{user.id}:*")
+        for key in keys:
+            redis_client.delete(key)
         
         response = {"result": result}
         redis_client.setex(cache_key, 3600, json.dumps(response))

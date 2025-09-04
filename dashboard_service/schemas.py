@@ -7,7 +7,7 @@ class HistoryResponse(BaseModel):
     user_id: int
     type: str
     query: str
-    result: str
+    result: Optional[str] = None
     created_at: datetime
     meta_data: Optional[str] = None
     class Config:
