@@ -1,0 +1,112 @@
+from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from models import History, User
+from schemas import HistoryResponse
+from database import get_db
+from dependencies import get_current_user
+from typing import Optional, List
+import redis
+import json
+import logging
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = os.getenv("REDIS_PORT")
+
+# Initialize Redis
+redis_client = redis.Redis(host=REDIS_HOST, port=int(REDIS_PORT), decode_responses=True)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/", response_model=List[HistoryResponse])
+async def get_dashboard(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    type: Optional[str] = Query(None, description="Filter by type (search/image)"),
+    keyword: Optional[str] = Query(None, description="Filter by keyword in query or result"),
+    date_start: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    date_end: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)")
+):
+    """Get user-specific dashboard history with filters"""
+    cache_key = f"dashboard:user:{user.id}:type{type or 'all'}:keyword{keyword or 'none'}:start{date_start or 'none'}:end{date_end or 'none'}"
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        logger.info(f"Returning cached history for user {user.id}")
+        return json.loads(cached_data)
+
+    query = db.query(History).filter(History.user_id == user.id)
+    if type:
+        query = query.filter(History.type == type)
+    if keyword:
+        query = query.filter(or_(History.query.contains(keyword), History.result.contains(keyword)))
+    if date_start:
+        query = query.filter(History.created_at >= date_start)
+    if date_end:
+        query = query.filter(History.created_at <= date_end)
+    
+    history = query.all()
+    redis_client.setex(cache_key, 3600, json.dumps([h.__dict__ for h in history]))
+    logger.info(f"User {user.username} fetched dashboard history")
+    return history
+
+@app.put("/dashboard/{id}", response_model=HistoryResponse)
+async def update_dashboard(
+    id: int,
+    update_data: dict,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update a specific history entry owned by the user"""
+    history = db.query(History).filter(History.id == id, History.user_id == user.id).first()
+    if not history:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    
+    if 'query' in update_data:
+        history.query = update_data['query']
+    if 'result' in update_data:
+        history.result = update_data['result']
+    
+    db.commit()
+    db.refresh(history)
+    
+    # Invalidate cache
+    redis_client.delete(f"dashboard:user:{user.id}:*")
+    logger.info(f"User {user.username} updated history entry {id}")
+    return history
+
+@app.delete("/dashboard/{id}")
+async def delete_dashboard(
+    id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete a specific history entry owned by the user"""
+    history = db.query(History).filter(History.id == id, History.user_id == user.id).first()
+    if not history:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    
+    db.delete(history)
+    db.commit()
+    
+    # Invalidate cache
+    redis_client.delete(f"dashboard:user:{user.id}:*")
+    logger.info(f"User {user.username} deleted history entry {id}")
+    return {"detail": "Entry deleted"}
